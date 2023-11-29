@@ -46,7 +46,7 @@ from .logging import Logger
 from .lnutil import LOCAL, REMOTE, HTLCOwner, ChannelType
 from . import json_db
 from .json_db import StoredDict, JsonDB, locked, modifier, StoredObject, stored_in, stored_as
-from .plugin import run_hook, plugin_loaders
+from .plugin import run_wizard_hook, plugin_loaders
 from .version import ELECTRUM_VERSION
 
 
@@ -1663,7 +1663,7 @@ class WalletDB(JsonDB):
         return file_list
 
     def get_action(self):
-        action = run_hook('get_action', self)
+        action = run_wizard_hook('get_action', self)
         return action
 
     def load_plugins(self):
