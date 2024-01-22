@@ -1,7 +1,7 @@
-import QtQuick 2.6
-import QtQuick.Layouts 1.0
-import QtQuick.Controls 2.1
-import QtQuick.Controls.Material 2.0
+import QtQuick
+import QtQuick.Layouts
+import QtQuick.Controls
+import QtQuick.Controls.Material
 
 import "../controls"
 
@@ -26,12 +26,12 @@ WizardComponent {
             onCheckedButtonChanged: checkIsLast()
         }
 
-        RadioButton {
+        ElRadioButton {
             ButtonGroup.group: wantproxygroup
             property bool wantproxy: true
             text: qsTr('Yes')
         }
-        RadioButton {
+        ElRadioButton {
             ButtonGroup.group: wantproxygroup
             property bool wantproxy: false
             text: qsTr('No')

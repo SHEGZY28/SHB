@@ -1,6 +1,6 @@
-import QtQuick 2.6
-import QtQuick.Layouts 1.0
-import QtQuick.Controls 2.1
+import QtQuick
+import QtQuick.Layouts
+import QtQuick.Controls
 
 import org.electrum 1.0
 
@@ -199,16 +199,6 @@ ElDialog {
             }
 
         }
-    }
-
-    // make clicking the dialog background move the scope away from textedit fields
-    // so the keyboard goes away
-    // TODO: here it works on desktop, but not android. hmm.
-    MouseArea {
-        anchors.fill: parent
-        z: -1000
-        onClicked: { parkFocus.focus = true }
-        FocusScope { id: parkFocus }
     }
 
 }

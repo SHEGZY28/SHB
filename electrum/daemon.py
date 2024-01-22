@@ -24,6 +24,7 @@
 # SOFTWARE.
 import asyncio
 import ast
+import errno
 import os
 import time
 import traceback
@@ -41,13 +42,13 @@ from aiorpcx import timeout_after, TaskTimeout, ignore_after
 
 from . import util
 from .network import Network
-from .util import (json_decode, to_bytes, to_string, profiler, standardize_path, constant_time_compare)
+from .util import (json_decode, to_bytes, to_string, profiler, standardize_path, constant_time_compare, InvalidPassword)
 from .invoices import PR_PAID, PR_EXPIRED
 from .util import log_exceptions, ignore_exceptions, randrange, OldTaskGroup
 from .util import EventListener, event_listener
 from .wallet import Wallet, Abstract_Wallet
 from .storage import WalletStorage
-from .wallet_db import WalletDB
+from .wallet_db import WalletDB, WalletRequiresSplit, WalletRequiresUpgrade, WalletUnfinished
 from .commands import known_commands, Commands
 from .simple_config import SimpleConfig
 from .exchange_rate import FxThread
@@ -357,8 +358,8 @@ class CommandsServer(AuthenticatedServer):
 
 class WatchTowerServer(AuthenticatedServer):
 
-    def __init__(self, network: 'Network', netaddress):
-        self.addr = netaddress
+    def __init__(self, network: 'Network', port:int):
+        self.port = port
         self.config = network.config
         self.network = network
         watchtower_user = self.config.WATCHTOWER_SERVER_USER or ""
@@ -373,9 +374,9 @@ class WatchTowerServer(AuthenticatedServer):
     async def run(self):
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
-        site = web.TCPSite(self.runner, host=str(self.addr.host), port=self.addr.port, ssl_context=self.config.get_ssl_context())
+        site = web.TCPSite(self.runner, host='localhost', port=self.port)
         await site.start()
-        self.logger.info(f"now running and listening. addr={self.addr}")
+        self.logger.info(f"running and listening on port {self.port}")
 
     async def get_ctn(self, *args):
         return await self.lnwatcher.get_ctn(*args)
@@ -411,6 +412,7 @@ class Daemon(Logger):
         if 'wallet_path' in config.cmdline_options:
             self.logger.warning("Ignoring parameter 'wallet_path' for daemon. "
                                 "Use the load_wallet command instead.")
+        self._plugins = None  # type: Optional[Plugins]
         self.asyncio_loop = util.get_asyncio_loop()
         if not self.config.NETWORK_OFFLINE:
             self.network = Network(config, daemon=self)
@@ -453,8 +455,8 @@ class Daemon(Logger):
         assert not self.config.NETWORK_OFFLINE
         assert self.network
         # server-side watchtower
-        if watchtower_address := self.config.get_netaddress(self.config.cv.WATCHTOWER_SERVER_ADDRESS):
-            self.watchtower = WatchTowerServer(self.network, watchtower_address)
+        if watchtower_port := self.config.WATCHTOWER_SERVER_PORT:
+            self.watchtower = WatchTowerServer(self.network, watchtower_port)
             asyncio.run_coroutine_threadsafe(self.taskgroup.spawn(self.watchtower.run), self.asyncio_loop)
 
         self.network.start(jobs=[self.fx.run])
@@ -480,16 +482,17 @@ class Daemon(Logger):
         return func_wrapper
 
     @with_wallet_lock
-    def load_wallet(self, path, password, *, manual_upgrades=True) -> Optional[Abstract_Wallet]:
+    def load_wallet(self, path, password, *, upgrade=False) -> Optional[Abstract_Wallet]:
         path = standardize_path(path)
         wallet_key = self._wallet_key_from_path(path)
         # wizard will be launched if we return
         if wallet := self._wallets.get(wallet_key):
             return wallet
-        wallet = self._load_wallet(path, password, manual_upgrades=manual_upgrades, config=self.config)
-        if wallet is None:
-            return
+        wallet = self._load_wallet(path, password, upgrade=upgrade, config=self.config)
         wallet.start_network(self.network)
+        # plugins must be loaded before add_wallet
+        if self._plugins:
+            self._plugins.load_plugins(wallet)
         self.add_wallet(wallet)
         return wallet
 
@@ -499,26 +502,22 @@ class Daemon(Logger):
             path,
             password,
             *,
-            manual_upgrades: bool = True,
+            upgrade: bool = False,
             config: SimpleConfig,
     ) -> Optional[Abstract_Wallet]:
         path = standardize_path(path)
         storage = WalletStorage(path)
         if not storage.file_exists():
-            return
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
         if storage.is_encrypted():
             if not password:
-                return
+                raise InvalidPassword('No password given')
             storage.decrypt(password)
         # read data, pass it to db
-        db = WalletDB(storage.read(), manual_upgrades=manual_upgrades)
-        if db.requires_split():
-            return
-        if db.requires_upgrade():
-            return
+        db = WalletDB(storage.read(), storage=storage, upgrade=upgrade)
         if db.get_action():
-            return
-        wallet = Wallet(db, storage, config=config)
+            raise WalletUnfinished(db)
+        wallet = Wallet(db, config=config)
         return wallet
 
     @with_wallet_lock
@@ -526,7 +525,7 @@ class Daemon(Logger):
         path = wallet.storage.path
         wallet_key = self._wallet_key_from_path(path)
         self._wallets[wallet_key] = wallet
-        run_hook('daemon_wallet_loaded', self, wallet)
+        run_hook('daemon_wallet_loaded', wallet, self)
 
     def get_wallet(self, path: str) -> Optional[Abstract_Wallet]:
         wallet_key = self._wallet_key_from_path(path)
@@ -560,6 +559,9 @@ class Daemon(Logger):
         return True
 
     def run_daemon(self):
+        # init plugins
+        self._plugins = Plugins(self.config, 'cmdline')
+        # block until we are stopping
         try:
             self._stopping_soon_or_errored.wait()
         except KeyboardInterrupt:
@@ -590,6 +592,11 @@ class Daemon(Logger):
                     if self.network:
                         await group.spawn(self.network.stop(full_shutdown=True))
                     await group.spawn(self.taskgroup.cancel_remaining())
+            if self._plugins:
+                self.logger.info("stopping plugins")
+                self._plugins.stop()
+                async with ignore_after(1):
+                    await self._plugins.stopped_event_async.wait()
         finally:
             if self.listen_jsonrpc:
                 self.logger.info("removing lockfile")
@@ -597,18 +604,20 @@ class Daemon(Logger):
             self.logger.info("stopped")
             self._stopped_event.set()
 
-    def run_gui(self, config: 'SimpleConfig', plugins: 'Plugins'):
+    def run_gui(self) -> None:
+        assert self.config
         threading.current_thread().name = 'GUI'
-        gui_name = config.GUI_NAME
+        gui_name = self.config.GUI_NAME
         if gui_name in ['lite', 'classic']:
             gui_name = 'qt'
+        self._plugins = Plugins(self.config, gui_name)  # init plugins
         self.logger.info(f'launching GUI: {gui_name}')
         try:
             try:
                 gui = __import__('electrum.gui.' + gui_name, fromlist=['electrum'])
             except GuiImportError as e:
                 sys.exit(str(e))
-            self.gui_object = gui.ElectrumGui(config=config, daemon=self, plugins=plugins)
+            self.gui_object = gui.ElectrumGui(config=self.config, daemon=self, plugins=self._plugins)
             if not self._stop_entered:
                 self.gui_object.main()
             else:
@@ -642,12 +651,11 @@ class Daemon(Logger):
             #                  hard-to-understand bugs will follow...
             if wallet is None:
                 try:
-                    wallet = self._load_wallet(path, old_password, manual_upgrades=False, config=self.config)
+                    wallet = self._load_wallet(path, old_password, upgrade=True, config=self.config)
                 except util.InvalidPassword:
                     pass
                 except Exception:
                     self.logger.exception(f'failed to load wallet at {path!r}:')
-                    pass
             if wallet is None:
                 failed.append(path)
                 continue

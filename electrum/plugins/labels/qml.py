@@ -1,12 +1,12 @@
 import threading
 
-from PyQt5.QtCore import pyqtSignal, pyqtSlot
+from PyQt6.QtCore import pyqtSignal, pyqtSlot
 
 from electrum.i18n import _
 from electrum.plugin import hook
 
 from electrum.gui.qml.qewallet import QEWallet
-from electrum.gui.qml.plugins import PluginQObject
+from electrum.gui.common_qt.plugins import PluginQObject
 
 from .labels import LabelsPlugin
 
@@ -127,8 +127,3 @@ class Plugin(LabelsPlugin):
         # important: QSignalObject needs to be parented, as keeping a ref
         # in the plugin is not enough to avoid gc
         self.so = Plugin.QSignalObject(self, self._app)
-
-        # If the user just enabled the plugin, the 'load_wallet' hook would not
-        # get called for already loaded wallets, hence we call it manually for those:
-        for wallet_name, wallet in app.daemon.daemon._wallets.items():
-            self.load_wallet(wallet)

@@ -1,7 +1,7 @@
-import QtQuick 2.6
-import QtQuick.Layouts 1.0
-import QtQuick.Controls 2.14
-import QtQuick.Controls.Material 2.0
+import QtQuick
+import QtQuick.Layouts
+import QtQuick.Controls
+import QtQuick.Controls.Material
 
 import org.electrum 1.0
 
@@ -62,15 +62,11 @@ ElDialog {
 
                     ElComboBox {
                         id: bumpMethodComboBox
-                        enabled: rbffeebumper.canChangeBumpMethod
 
                         textRole: 'text'
                         valueRole: 'value'
 
-                        model: [
-                            { text: qsTr('Preserve payment'), value: 'preserve_payment' },
-                            { text: qsTr('Decrease payment'), value: 'decrease_payment' }
-                        ]
+                        model: rbffeebumper.bumpMethodsAvailable
                         onCurrentValueChanged: {
                             if (activeFocus)
                                 rbffeebumper.bumpMethod = currentValue
@@ -182,9 +178,12 @@ ElDialog {
                     }
                 }
 
-                Label {
+                InfoTextArea {
                     Layout.columnSpan: 2
-                    Layout.fillWidth: true
+                    Layout.preferredWidth: parent.width * 3/4
+                    Layout.alignment: Qt.AlignHCenter
+                    Layout.topMargin: constants.paddingLarge
+                    iconStyle: InfoTextArea.IconStyle.Warn
                     visible: rbffeebumper.warning != ''
                     text: rbffeebumper.warning
                 }

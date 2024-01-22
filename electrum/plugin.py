@@ -27,12 +27,18 @@ import pkgutil
 import importlib.util
 import time
 import threading
+import traceback
 import sys
+import json
 from typing import (NamedTuple, Any, Union, TYPE_CHECKING, Optional, Tuple,
-                    Dict, Iterable, List, Sequence, Callable, TypeVar, Mapping)
+                    Dict, Iterable, List, Sequence, Callable, TypeVar, Mapping, Set)
 import concurrent
+import zipimport
 from concurrent import futures
 from functools import wraps, partial
+from enum import IntEnum
+from packaging.version import parse as parse_version
+from electrum.version import ELECTRUM_VERSION
 
 from .i18n import _
 from .util import (profiler, DaemonThread, UserCancelled, ThreadJob, UserFacingException)
@@ -53,27 +59,63 @@ hook_names = set()
 hooks = {}
 
 
+
+class ExternalPluginCodes(IntEnum):
+    SUCCESS = 0
+    MISSING_MANIFEST = 1
+    NAME_ALREADY_IN_USE = 2
+    UNABLE_TO_COPY_FILE = 3
+    INSTALLED_BUT_FAILED_LOAD = 4
+    INCOMPATIBLE_VERSION = 5
+    INCOMPATIBLE_ZIP_FORMAT = 6
+    INVALID_MANIFEST_JSON = 7
+    INVALID_MANIFEST_DISPLAY_NAME = 8
+    INVALID_MANIFEST_DESCRIPTION = 9
+    INVALID_MANIFEST_VERSION = 10
+    INVALID_MANIFEST_MINIMUM_EC_VERSION = 11
+    INVALID_MANIFEST_PACKAGE_NAME = 12
+    UNSPECIFIED_ERROR = 13
+
+
+
 class Plugins(DaemonThread):
 
     LOGGING_SHORTCUT = 'p'
+    pkgpath = os.path.dirname(plugins.__file__)
 
     @profiler
     def __init__(self, config: SimpleConfig, gui_name):
         DaemonThread.__init__(self)
         self.name = 'Plugins'  # set name of thread
-        self.pkgpath = os.path.dirname(plugins.__file__)
         self.config = config
         self.hw_wallets = {}
         self.plugins = {}  # type: Dict[str, BasePlugin]
+        self.internal_plugin_metadata = {}
+        self.external_plugin_metadata = {}
         self.gui_name = gui_name
-        self.descriptions = {}
         self.device_manager = DeviceMgr(config)
-        self.load_plugins()
+        self.user_pkgpath = os.path.join(self.config.electrum_path_root(), 'plugins')
+        if not os.path.exists(self.user_pkgpath):
+            os.mkdir(self.user_pkgpath)
+        self.find_internal_plugins()
+        self.find_external_plugins()
         self.add_jobs(self.device_manager.thread_jobs())
         self.start()
 
-    def load_plugins(self):
-        for loader, name, ispkg in pkgutil.iter_modules([self.pkgpath]):
+    @property
+    def descriptions(self):
+        return dict(list(self.internal_plugin_metadata.items()) + list(self.external_plugin_metadata.items()))
+
+    def find_internal_plugins(self) -> Mapping[str, dict]:
+        """Populates self.internal_plugin_metadata
+        """
+        iter_modules = list(pkgutil.iter_modules([self.pkgpath]))
+        for loader, name, ispkg in iter_modules:
+            # FIXME pyinstaller binaries are packaging each built-in plugin twice:
+            #       once as data and once as code. To honor the "no duplicates" rule below,
+            #       we exclude the ones packaged as *code*, here:
+            if loader.__class__.__qualname__ == "FrozenImporter":
+                continue
             full_name = f'electrum.plugins.{name}'
             spec = importlib.util.find_spec(full_name)
             if spec is None:  # pkgutil found it but importlib can't ?!
@@ -87,6 +129,9 @@ class Plugins(DaemonThread):
             except Exception as e:
                 raise Exception(f"Error pre-loading {full_name}: {repr(e)}") from e
             d = module.__dict__
+            if 'fullname' not in d:
+                continue
+            d['display_name'] = d['fullname']
             gui_good = self.gui_name in d.get('available_for', [])
             if not gui_good:
                 continue
@@ -96,12 +141,156 @@ class Plugins(DaemonThread):
             details = d.get('registers_keystore')
             if details:
                 self.register_keystore(name, gui_good, details)
-            self.descriptions[name] = d
-            if not d.get('requires_wallet_type') and self.config.get('use_' + name):
+            if d.get('requires_wallet_type'):
+                # trustedcoin will not be added to list
+                continue
+            if name in self.internal_plugin_metadata:
+                _logger.info(f"Found the following plugin modules: {iter_modules=}")
+                raise Exception(f"duplicate plugins? for {name=}")
+            self.internal_plugin_metadata[name] = d
+
+    def load_plugins(self, wallet):
+        self.load_internal_plugins(wallet)
+        self.load_external_plugins(wallet)
+
+    def load_internal_plugins(self, wallet):
+        for name, d in self.internal_plugin_metadata.items():
+            enabled = wallet.enabled_plugins.get(name)
+            if enabled:
                 try:
-                    self.load_plugin(name)
+                    self.load_internal_plugin(name)
                 except BaseException as e:
                     self.logger.exception(f"cannot initialize plugin {name}: {e}")
+
+    def load_external_plugin(self, name):
+        if name in self.plugins:
+            return self.plugins[name]
+        # If we do not have the metadata, it was not detected by `load_external_plugins`
+        # on startup, or added by manual user installation after that point.
+        metadata = self.external_plugin_metadata.get(name, None)
+        if metadata is None:
+            self.logger.exception("attempted to load unknown external plugin %s" % name)
+            return
+        plugin_file_path = metadata["__file__"]
+        try:
+            zipfile = zipimport.zipimporter(plugin_file_path)
+        except zipimport.ZipImportError:
+            self.logger.exception("unable to load zip plugin '%s'" % plugin_file_path)
+            return
+        try:
+            module = zipfile.load_module(name)
+        except zipimport.ZipImportError as e:
+            self.logger.exception(f"unable to load zip plugin '{plugin_file_path}' package '{name}'")
+            return
+        sys.modules['electrum_external_plugins.'+ name] = module
+        full_name = f'electrum_external_plugins.{name}.{self.gui_name}'
+        spec = importlib.util.find_spec(full_name)
+        if spec is None:
+            raise RuntimeError("%s implementation for %s plugin not found"
+                               % (self.gui_name, name))
+        module = importlib.util.module_from_spec(spec)
+        self._register_module(spec, module)
+        if sys.version_info >= (3, 10):
+            spec.loader.exec_module(module)
+        else:
+            module = spec.loader.load_module(full_name)
+        plugin = module.Plugin(self, self.config, name)
+        self.add_jobs(plugin.thread_jobs())
+        self.plugins[name] = plugin
+        self.logger.info(f"loaded external plugin {name}")
+        return plugin
+
+    @staticmethod
+    def _register_module(spec, module):
+        # sys.modules needs to be modified for relative imports to work
+        # see https://stackoverflow.com/a/50395128
+        sys.modules[spec.name] = module
+
+    def get_external_plugin_dir(self):
+        return self.user_pkgpath
+
+    def find_external_plugins(self):
+        external_plugin_dir = self.get_external_plugin_dir()
+        # Unit tests, environment does not lead to finding a user dir, there will be none to load anyway.
+        if external_plugin_dir is None:
+            return
+        for file_name in os.listdir(external_plugin_dir):
+            plugin_file_path = os.path.join(external_plugin_dir, file_name)
+            leading_name, ext = os.path.splitext(file_name)
+            if ext.lower() != ".zip" or not os.path.isfile(plugin_file_path):
+                continue
+            metadata, error_code = self.get_metadata_from_external_plugin_zip_file(plugin_file_path)
+            if metadata is None:
+                continue
+            package_name = metadata['package_name']
+            if package_name in self.internal_plugin_metadata:
+                self.logger.exception("internal plugin also named '%s', external '%s' rejected" % (package_name, file_name))
+                continue
+            #if not self.register_plugin(package_name, metadata, is_external=True):
+            #    continue
+            metadata["__file__"] = plugin_file_path
+            self.external_plugin_metadata[package_name] = metadata
+
+    def load_external_plugins(self, wallet):
+        for package_name in self.external_plugin_metadata.keys():
+            enabled = wallet.enabled_plugins.get(package_name)
+            if enabled:
+                try:
+                    self.load_external_plugin(package_name)
+                except BaseException as e:
+                    traceback.print_exc(file=sys.stdout) # shouldn't this be... suppressed unless -v?
+                    self.logger.exception(f"cannot initialize plugin {package_name} {e!r}")
+
+    def get_metadata_from_external_plugin_zip_file(self, plugin_file_path):
+        file_name = os.path.basename(plugin_file_path)
+        try:
+            zipfile = zipimport.zipimporter(plugin_file_path)
+            metadata_text = zipfile.get_data("manifest.json")
+        except zipimport.ZipImportError:
+            self.logger.exception("unable to load zip plugin for %s" % file_name)
+            return None, ExternalPluginCodes.INCOMPATIBLE_ZIP_FORMAT
+        except OSError:
+            self.logger.exception("missing 'manifest.json' (zip plugin %s)" % file_name)
+            return None, ExternalPluginCodes.MISSING_MANIFEST
+        except Exception as e:
+            self.logger.exception(f"Exception opening {file_name}: {repr(e)}")
+            return None, ExternalPluginCodes.UNSPECIFIED_ERROR
+        try:
+            metadata = json.loads(metadata_text)
+        except json.JSONDecodeError:
+            self.logger.exception("invalid json in 'manifest.json' (zip plugin %s)" % file_name)
+            return None, ExternalPluginCodes.INVALID_MANIFEST_JSON
+
+        class Version:
+            pass
+
+        expected_keys = {
+            'display_name': (str, ExternalPluginCodes.INVALID_MANIFEST_DISPLAY_NAME),
+            'description': (str, ExternalPluginCodes.INVALID_MANIFEST_DESCRIPTION),
+            'version': (Version, ExternalPluginCodes.INVALID_MANIFEST_VERSION),
+            'minimum_electrum_version': (Version, ExternalPluginCodes.INVALID_MANIFEST_MINIMUM_EC_VERSION),
+            'package_name': (str, ExternalPluginCodes.INVALID_MANIFEST_PACKAGE_NAME),
+        }
+        for k, (expected_type, error_code) in expected_keys.items():
+            v = metadata.get(k, None)
+            if v is None:
+                self.logger.exception("missing metadata key %s (zip plugin %s)" % (k, file_name))
+                return None, error_code
+            if expected_type is Version:
+                try:
+                    parse_version(v)
+                except ValueError:
+                    self.logger.exception("metadata %s = %s, expected a.b.c version string (zip plugin %s)" % (k, v, file_name))
+                    return None, error_code
+            elif type(metadata[k]) is not expected_type:
+                self.logger.exception("metadata %s = %s, expected %s (zip plugin %s)" % (k, v, expected_type, file_name))
+                return None, error_code
+
+        if parse_version(metadata['minimum_electrum_version']) > parse_version(ELECTRUM_VERSION):
+            self.logger.exception("incompatible version")
+            return None, ExternalPluginCodes.INCOMPATIBLE_VERSION
+
+        return metadata, ExternalPluginCodes.SUCCESS
 
     def get(self, name):
         return self.plugins.get(name)
@@ -110,9 +299,20 @@ class Plugins(DaemonThread):
         return len(self.plugins)
 
     def load_plugin(self, name) -> 'BasePlugin':
+        """Imports the code of the given plugin.
+        note: can be called from any thread.
+        """
+        if name in self.internal_plugin_metadata:
+            return self.load_internal_plugin(name)
+        elif name in self.external_plugin_metadata:
+            return self.load_external_plugin(name)
+        else:
+            raise Exception()
+
+    def load_internal_plugin(self, name) -> 'BasePlugin':
         if name in self.plugins:
             return self.plugins[name]
-        full_name = f'electrum.plugins.{name}.{self.gui_name}'
+        full_name = f'electrum.plugins.{name}' + f'.{self.gui_name}'
         spec = importlib.util.find_spec(full_name)
         if spec is None:
             raise RuntimeError("%s implementation for %s plugin not found"
@@ -125,21 +325,21 @@ class Plugins(DaemonThread):
             raise Exception(f"Error loading {name} plugin: {repr(e)}") from e
         self.add_jobs(plugin.thread_jobs())
         self.plugins[name] = plugin
-        self.logger.info(f"loaded {name}")
+        self.logger.info(f"loaded plugin {name!r}. (from thread: {threading.current_thread().name!r})")
         return plugin
 
     def close_plugin(self, plugin):
         self.remove_jobs(plugin.thread_jobs())
 
-    def enable(self, name: str) -> 'BasePlugin':
-        self.config.set_key('use_' + name, True, save=True)
+    def enable(self, wallet, name: str) -> 'BasePlugin':
+        wallet.enabled_plugins[name] = True
         p = self.get(name)
         if p:
             return p
         return self.load_plugin(name)
 
-    def disable(self, name: str) -> None:
-        self.config.set_key('use_' + name, False, save=True)
+    def disable(self, wallet, name: str) -> None:
+        wallet.enabled_plugins.pop(name, None)
         p = self.get(name)
         if not p:
             return
@@ -147,9 +347,9 @@ class Plugins(DaemonThread):
         p.close()
         self.logger.info(f"closed {name}")
 
-    def toggle(self, name: str) -> Optional['BasePlugin']:
+    def toggle(self, wallet, name: str) -> Optional['BasePlugin']:
         p = self.get(name)
-        return self.disable(name) if p else self.enable(name)
+        return self.disable(wallet, name) if p else self.enable(wallet, name)
 
     def is_available(self, name: str, wallet: 'Abstract_Wallet') -> bool:
         d = self.descriptions.get(name)
@@ -171,7 +371,7 @@ class Plugins(DaemonThread):
             if gui_good:
                 try:
                     p = self.get_plugin(name)
-                    if p.is_enabled():
+                    if p.is_available():
                         out.append(HardwarePluginToScan(name=name,
                                                         description=details[2],
                                                         plugin=p,
@@ -209,7 +409,7 @@ class Plugins(DaemonThread):
 
     def run(self):
         while self.is_running():
-            time.sleep(0.1)
+            self.wake_up_event.wait(0.1)  # time.sleep(0.1) OR event
             self.run_jobs()
         self.on_stop()
 
@@ -219,11 +419,17 @@ def hook(func):
     return func
 
 
-def run_hook(name, *args):
+def run_wizard_hook(name, *args):
+    """ hook that does not need to pass wallet """
+    return run_hook(name, None, *args, is_wizard_hook=True)
+
+def run_hook(name, wallet, *args, is_wizard_hook=False):
     results = []
+    if not is_wizard_hook:
+        args = (wallet,) + args
     f_list = hooks.get(name, [])
     for p, f in f_list:
-        if p.is_enabled():
+        if is_wizard_hook or (wallet and p.is_enabled(wallet)):
             try:
                 r = f(*args)
             except Exception:
@@ -243,7 +449,7 @@ class BasePlugin(Logger):
         self.parent = parent  # type: Plugins  # The plugins object
         self.name = name
         self.config = config
-        self.wallet = None
+        self.wallet = None # fixme: this field should not exist
         Logger.__init__(self)
         # add self to hooks
         for k in dir(self):
@@ -279,8 +485,8 @@ class BasePlugin(Logger):
     def thread_jobs(self):
         return []
 
-    def is_enabled(self):
-        return self.is_available() and self.config.get('use_'+self.name) is True
+    def is_enabled(self, wallet):
+        return self.is_available() and wallet.enabled_plugins.get(self.name) is True
 
     def is_available(self):
         return True
@@ -343,6 +549,16 @@ _hwd_comms_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix='hwd_comms_thread'
 )
+
+# hidapi needs to be imported from the main thread. Otherwise, at least on macOS,
+# segfaults will follow. (see https://github.com/trezor/cython-hidapi/pull/150#issuecomment-1542391087)
+# To keep it simple, let's just import it now, as we are likely in the main thread here.
+if threading.current_thread() is not threading.main_thread():
+    _logger.warning("expected to be in main thread... hidapi will not be safe to use now!")
+try:
+    import hid
+except ImportError:
+    pass
 
 
 T = TypeVar('T')

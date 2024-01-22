@@ -1,6 +1,6 @@
-import QtQuick 2.0
-import QtQuick.Controls 2.3
-import QtQuick.Controls.Material 2.0
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Controls.Material
 
 Pane {
     id: root
@@ -18,6 +18,9 @@ Pane {
 
     background: Rectangle {
         color: Material.dialogColor
+        TapHandler {
+            onTapped: root.forceActiveFocus()
+        }
     }
 
     onAccept: {

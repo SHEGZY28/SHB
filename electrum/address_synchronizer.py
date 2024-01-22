@@ -110,8 +110,14 @@ class AddressSynchronizer(Logger, EventListener):
         self.remove_local_transactions_we_dont_have()
 
     def is_mine(self, address: Optional[str]) -> bool:
-        """Returns whether an address is in our set
-        Note: This class has a larget set of addresses than the wallet
+        """Returns whether an address is in our set.
+
+        Differences between adb.is_mine and wallet.is_mine:
+        - adb.is_mine: addrs that we are watching (e.g. via Synchronizer)
+            - lnwatcher adds its own lightning-related addresses that are not part of the wallet
+        - wallet.is_mine: addrs that are part of the wallet balance or the wallet might sign for
+            - an offline wallet might learn from a PSBT about addrs beyond its gap limit
+        Neither set is guaranteed to be a subset of the other.
         """
         if not address: return False
         return self.db.is_addr_in_history(address)
@@ -193,6 +199,7 @@ class AddressSynchronizer(Logger, EventListener):
     @event_listener
     def on_event_blockchain_updated(self, *args):
         self._get_balance_cache = {}  # invalidate cache
+        self.db.put('stored_height', self.get_local_height())
 
     async def stop(self):
         if self.network:
@@ -206,7 +213,6 @@ class AddressSynchronizer(Logger, EventListener):
                 self.synchronizer = None
                 self.verifier = None
                 self.unregister_callbacks()
-                self.db.put('stored_height', self.get_local_height())
 
     def add_address(self, address):
         if address not in self.db.history:
@@ -415,8 +421,10 @@ class AddressSynchronizer(Logger, EventListener):
                 children |= self.get_depending_transactions(other_hash)
             return children
 
-    def receive_tx_callback(self, tx_hash: str, tx: Transaction, tx_height: int) -> None:
-        self.add_unverified_or_unconfirmed_tx(tx_hash, tx_height)
+    def receive_tx_callback(self, tx: Transaction, tx_height: int) -> None:
+        txid = tx.txid()
+        assert txid is not None
+        self.add_unverified_or_unconfirmed_tx(txid, tx_height)
         self.add_transaction(tx, allow_unrelated=True)
 
     def receive_history_callback(self, addr: str, hist, tx_fees: Dict[str, int]):
